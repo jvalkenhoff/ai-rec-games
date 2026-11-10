@@ -5,6 +5,7 @@ from getpass import getpass
 from dotenv import load_dotenv
 from playwright.sync_api import (
   sync_playwright,
+  Page,
   Locator,
   TimeoutError as PlaywrightTimeoutError,
   )
@@ -101,60 +102,65 @@ def parse_game(row: Locator) -> dict:
     "Reviews": parse_reviews(row),
   }
 
+def load_page(page: Page, url: str) -> Locator:
+  """Loads the full discount page first. Locator makes sure the important DOM elements are actually present."""
+  response = page.goto(url, wait_until='domcontentloaded')
+  if not response or not response.ok:
+    raise RuntimeError("Failed to load Steam website")
+
+  rows = page.locator("a.search_result_row")
+  rows.first.wait_for(state='visible', timeout=20000)
+  print("Games are visible and ready to scrape!")
+  return rows
+
+def collect_games(rows: Locator, start: int, games: list[dict], max_games: int) -> int:
+  """Parse rows from `start` onward into `games`. Returns the new processed count."""
+  count = rows.count()
+
+  for i in range(start, count):
+    if len(games) >= max_games:
+      break
+
+    game = parse_game(rows.nth(i))
+    if game["Title"] and game["URL"]:
+      games.append(game)
+
+  return count
+
+def load_more_games(page: Page, rows: Locator) -> bool:
+  """Scroll behavior to trigger infinite loading if necessary. Returns True if news rows appeared."""
+  previous_count = rows.count()
+  rows.last.scroll_into_view_if_needed()
+  page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+  try:
+    print("We have to scroll, please wait...")
+    page.wait_for_function(
+      f"previous => document.querySelectorAll('a.search_result_row').length > previous",
+      arg=previous_count,
+      timeout=8000,
+    )
+    return True
+  except PlaywrightTimeoutError:
+    print("No additional games loaded")
+    return False
+
 def scrape_games(url: str, max_games: int) -> list[dict]:
   games: list[dict] = []
   processed_count = 0
 
   with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
-    context = browser.new_context(locale="en-US")
-    page = context.new_page()
 
     try:
-      response = page.goto(url, wait_until='domcontentloaded')
-      rows = page.locator("a.search_result_row")
-      
-      if not response or not response.ok:
-        raise RuntimeError("Failed to load Steam website")
-
-      rows.first.wait_for(state='visible', timeout=20000)
-      print("Games are visible and ready to scrape!")
+      page = browser.new_context(locale="en-US").new_page()
+      rows = load_page(page=page, url=url)
 
       while len(games) < max_games:
-        count = rows.count()
-
-        for i in range(processed_count, count):
-          game = parse_game(rows.nth(i))
-
-          if game["Title"] and game["URL"]:
-            games.append(game)
-
-          if len(games) >= max_games:
-            break
-
-        processed_count = count
-
+        processed_count = collect_games(rows, processed_count, games, max_games)
         print(f"Collected {len(games)} games")
 
-        if len(games) >= max_games:
-          break
-
-        # Trigger infinite scrolling
-        previous_count = rows.count()
-        rows.last.scroll_into_view_if_needed()
-
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-
-        # js arrow function that evaluates whether current game count than previous count
-        try:
-          print("We have to scroll, please wait...")
-          page.wait_for_function(
-            """previous => document.querySelectorAll('a.search_result_row').length > previous""",
-            arg=previous_count,
-            timeout=8000,
-          )
-        except PlaywrightTimeoutError:
-          print("No additional games loaded")
+        if len(games) >= max_games or not load_more_games(page, rows):
           break
     finally:
       browser.close()
